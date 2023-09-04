@@ -88,7 +88,7 @@ ENV {{item[0]}}={{item[1]}}
 {% endif -%}
 
 # Build arguments for custom/authenticated software repositories
-ARG PIP_INDEX_URL="https://pipy.python.org/simple"
+ARG PIP_INDEX_URL="https://pypi.python.org/simple"
 
 {% if path -%}
 # Special case PATH

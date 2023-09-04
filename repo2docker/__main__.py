@@ -286,7 +286,7 @@ def get_argparser():
     argparser.add_argument(
         "--pip-index-url",
         type=str,
-        default="https://pipy.python.org/simple",
+        default="https://pypi.python.org/simple",
         help=Repo2Docker.pip_index_url.help,
     )
 
