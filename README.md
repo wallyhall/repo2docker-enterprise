@@ -30,6 +30,180 @@ For more information, please visit
 
 ---
 
+## Using the "enterprise" additions
+
+The intention of this [repo2docker](http://repo2docker.readthedocs.io) fork is to remain fully backward-compatible.  The following
+CLI arguments have been _added_ to enable using the tool in an enterprise context.
+
+### Authenticated `pip`
+
+Your choice of `pip` "index URL" can be supplied by specifying `--pip-index-url <INDEX_URL>`.  This will be injected into the ephemeral `Dockerfile` interally created by repo2docker as a build argument and exposed to `pip` via the (build-time) environment.  You can see the effect of this by specifying `--pip-index-url` and `--no-build` together.
+
+If your `pip` repository requires authentication, the following additional arguments can also be supplied:
+
+   - `--pip-auth <AUTH_TYPE>`<br>
+     Valid authentication types are `basic` (HTTP basic auth), `azure-sp-key` and `azure-sp-certificate` (for Azure Service Principals).
+   - `--pip-identity <IDENTITY>`<br>
+     The "identity" for authenticating against the `pip` repository.  For HTTP basic auth, this is the username.  For Azure Service Principals, specify the Tenant and App Registration's Client ID in the form `<TENANT_ID>/<CLIENT_ID>` (e.g.: `aaaa-bbbb-cccc-dddd-eeee/tttt-uuuu-vvvv-wwww-xxxx`).
+   - `--pip-secret <SECRET>`<br>
+     The "secret" for authenticating against the `pip` repository.  For HTTP basic auth, this is the password.  For Azure Service Principals, this is the "secret" (password) for the associated App Registration, or a PEM formatted certificate + private key.
+
+## Combining the "enterprise" additions with BinderHub
+
+If you're using BinderHub and wish to use the aforementioned "enterprise" additions, [KubeMod](https://github.com/kubemod/kubemod) can fulfil your requirements.
+
+### Authenticating against git repositories
+
+In an enterprise context, it's likely your notebooks reside in git repositories mandating authentication.  Assuming you've deployed BinderHub atop `microk8s`, you can use the following instructions to have KubeMod inject the required SSH configuration into repo2docker immediate before build-time.
+
+You will need to use a repo2docker container image with the SSH client installed (the official image presently does not).  These instructions assume you have built the Dockerfile in this repository and and tagged it `repo2docker-enterprise`.
+
+These should be adaptable for other flavours of Kubernetes.
+
+```
+# On the microk8s host:
+sudo mkdir -p /srv/hostdata/pvc-ssh-config
+cd /srv/hostdata/pvc-ssh-config/
+# Replace bitbucket.com with your git provider
+ssh-keyscan -t rsa bitbucket.com | sudo tee -a known_hosts
+sudo ssh-keygen  # don't supply a password
+```
+
+The SSH configuration can be made available to pods running on Kubernetes as a persistent volume.  The following Kubernetes manifest does this:
+
+```
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: pvc-ssh-config
+spec:
+  accessModes:
+  - ReadWriteOnce
+  capacity:
+    storage: 100Mi
+  storageClassName: local-storage-dir
+  volumeMode: Filesystem
+  local:
+    fsType: ""
+    path: /srv/hostdata/pvc-ssh-config
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pvc-ssh-config
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Mi
+  volumeName: pvc-ssh-config
+```
+
+BinderHub itself also needs to have this SSH configuration injected into it, and needs to be instructed to use the `repo2docker-enterprise` container image for builds.  This can be done via the following BinderHub Helm chart values:
+
+```
+config:
+  BinderHub:
+    build_image: repo2docker-enterprise:latest
+  KubernetesBuildExecutor:
+    build_image: repo2docker-enterprise:latest
+
+extraVolumes:
+  - name: pvc-ssh-config
+    persistentVolumeClaim:
+      claimName: pvc-ssh-config
+extraVolumeMounts:
+  - name: pvc-ssh-config
+    mountPath: /root/.ssh
+```
+
+Finally for repo2docker itself, we use KubeMod to apply a real-time "JIT" patch as required:
+
+```
+apiVersion: api.kubemod.io/v1beta1
+kind: ModRule
+metadata:
+  name: repo2docker-enterprise-patch
+spec:
+  type: Patch
+
+  match:
+    - select: '$.kind'
+      matchValue: 'Pod'
+
+    - select: '$.metadata.labels.component'
+      matchValue: 'binderhub-build'
+
+  patch:
+    - op: add
+      path: /spec/volumes/-1
+      value: |-
+        name: pvc-ssh-config
+        persistentVolumeClaim:
+          claimName: pvc-ssh-config
+
+    # if you are using a private repository for hosting repo2docker-enterprise ...
+    - op: add
+      path: /spec/imagePullSecrets/-1
+      value: |-
+        name: image-pull-secret
+
+    - op: add
+      select: '$.spec.containers[? @.name == "builder" ]'
+      path: /spec/containers/#0/volumeMounts/-1
+      value: |-
+        mountPath: /root/.ssh
+        name: pvc-ssh-config
+        readOnly: true
+```
+
+This KubeMod patch identifies the repo2docker pods when they are started by BinderHub and adds the SSH configuration volume.
+
+### Authenticating against `pip` repositories
+
+Follow the instructions above for adding authenticated git support, skipping the SSH volumes etc if they're not needed.  In the KubeMod manifest, append the following additional directives which will append `--pip-auth ...` CLI arguments to repo2docker:
+
+```
+    - op: add
+      select: '$.spec.containers[? @.name == "builder" ]'
+      path: /spec/containers/#0/args/-2
+      value: "--pip-auth"
+    - op: add
+      select: '$.spec.containers[? @.name == "builder" ]'
+      path: /spec/containers/#0/args/-2
+      value: "azure-sp-key"
+
+    - op: add
+      select: '$.spec.containers[? @.name == "builder" ]'
+      path: /spec/containers/#0/args/-2
+      value: "--pip-index-url"
+    - op: add
+      select: '$.spec.containers[? @.name == "builder" ]'
+      path: /spec/containers/#0/args/-2
+      value: "https://pkgs.dev.azure.com/<ORGANISATION>/<PROJECT_GUID>/_packaging/<REPOSITORY>/pypi/simple/"
+
+    - op: add
+      select: '$.spec.containers[? @.name == "builder" ]'
+      path: /spec/containers/#0/args/-2
+      value: "--pip-identity"
+    - op: add
+      select: '$.spec.containers[? @.name == "builder" ]'
+      path: /spec/containers/#0/args/-2
+      value: "<TENANT_ID>/<CLIENT_ID>"
+
+    - op: add
+      select: '$.spec.containers[? @.name == "builder" ]'
+      path: /spec/containers/#0/args/-2
+      value: "--pip-secret"
+    - op: add
+      select: '$.spec.containers[? @.name == "builder" ]'
+      path: /spec/containers/#0/args/-2
+      value: "<APP_REG_SECRET>"
+```
+
+Configure the argument values as appropriate.
+
 ## Using repo2docker
 
 ### Prerequisites
