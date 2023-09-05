@@ -16,12 +16,12 @@ import sys
 import tempfile
 import time
 import warnings
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse, quote
 
 import entrypoints
 import escapism
 from pythonjsonlogger import jsonlogger
-from traitlets import Any, Bool, Dict, Int, List, Unicode, default, observe
+from traitlets import Any, Bool, Dict, Int, List, Unicode, CaselessStrEnum, default, observe
 from traitlets.config import Application
 
 from . import __version__, contentproviders
@@ -462,6 +462,60 @@ class Repo2Docker(Application):
         """,
     )
 
+    pip_index_url = Unicode(
+        "https://pypi.python.org/simple",
+        config=True,
+        help="""
+        Sets the pip index URL.
+        """
+    )
+
+    pip_auth = CaselessStrEnum(
+        [
+            "none",
+            "basic",
+            "azure-sp-key",
+            "azure-sp-certificate"
+        ],
+        "none",
+        config=True,
+        help="""
+        pip authentication mechanism.
+
+        - Generic options
+        
+          - "none" (default), authentication is disabled.
+          - "basic" uses simple HTTP username+password authentication.
+            Provide pip_identity for username, pip_secret for password.
+          
+        - For Azure DevOps, a service principal must be defined
+          by --pip-identity in the format "<tenant_id>/<client_id>"
+          (delimited by a forward-slash)
+
+          - "azure-sp-key" requests a temporary authentication token
+            from Azure using a Service Principal key (password).
+            Provide pip_secret for the Service Principal key.
+          - "azure-sp-certificate" requests a temporary authentication
+            token from Azure using a Service Principal certificate. 
+        """
+    )
+
+    pip_identity = Unicode(
+        "",
+        config=True,
+        help="""
+        See pip_auth mechanisms.
+        """
+    )
+
+    pip_secret = Unicode(
+        "",
+        config=True,
+        help="""
+        See pip_auth mechanisms.
+        """
+    )
+
     def get_engine(self):
         """Return an instance of the container engine.
 
@@ -758,6 +812,58 @@ class Repo2Docker(Application):
                     return True
         return False
 
+    def _get_authenticated_pip_index_url(self):
+        url = urlparse(self.pip_index_url)
+
+        auth = str(self.pip_auth).lower()
+
+        # we perform authentication exchange if required even in dry-mode,
+        # so the user can validate that it worked.
+        if auth == "basic":
+            username = quote(self.pip_identity)
+            password = quote(self.pip_secret)
+            url = url._replace(netloc="{}:{}@{}".format(username, password, url.hostname))
+
+        elif auth == "azure-sp-key" or auth == "azure-sp-certificate":
+            from azure.identity import CertificateCredential, ClientSecretCredential
+            from azure.core.exceptions import ClientAuthenticationError
+            
+            try:
+                tenant_id, client_id = str(self.pip_identity).split('/', 1)
+            except ValueError as e:
+                self.log.error(e)
+                self.log.error("\nAzure SP authentication for pip authentication specified " +
+                               "but identity was not in the form '<tenant_id>/<client_id>' - " +
+                               "unable to proceed\n")
+                self.exit(1)
+
+            try:
+                if auth == "azure-sp-key":
+                    credential = ClientSecretCredential(
+                        tenant_id=tenant_id,
+                        client_id=client_id,
+                        client_secret=self.pip_secret
+                    )
+                else:
+                    credential = CertificateCredential(
+                        tenant_id=tenant_id,
+                        client_id=client_id,
+                        certificate_data=str(self.pip_secret).encode()
+                    )
+            except ClientAuthenticationError as e:
+                self.log.error("\nAzure SP authentication for pip authentication specified " +
+                               f"but authentication failed: {e}\n")
+                self.exit(1)
+            except Exception as e:
+                self.log.error(f"\nThere was an unexpected issue processing the Azure SP authentication: {e}\n")
+                self.exit(1)
+
+            # 499b84ac-1321-427f-aa17-267ca6975798/.default   (universally ADO)
+            token, _ = credential.get_token("499b84ac-1321-427f-aa17-267ca6975798/.default")
+            url = url._replace(netloc="{}:{}@{}".format("", token, url.hostname))
+
+        return urlunparse(url)
+
     def build(self):
         """
         Build docker image
@@ -834,6 +940,9 @@ class Repo2Docker(Application):
                 if self.target_repo_dir:
                     build_args["REPO_DIR"] = self.target_repo_dir
                 build_args.update(self.extra_build_args)
+
+                # Handle pip authentication
+                build_args["PIP_INDEX_URL"] = self._get_authenticated_pip_index_url()
 
                 if self.dry_run:
                     print(picked_buildpack.render(build_args))
